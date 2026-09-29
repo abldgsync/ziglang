@@ -1,8 +1,8 @@
 name: Do Tools Sync For Abldg
 
+# 共享同步逻辑位于私有仓库 shared_actions/sync_zig.yaml(组合 action)
+# 请将下方 OWNER 替换为你的 GitHub 组织/用户名
 on:
-  # schedule:
-  #   - cron: '0 2 * * *'  # 已屏蔽,不再定时执行
   workflow_dispatch:
     inputs:
       binvern:
@@ -13,142 +13,16 @@ on:
 permissions:
   contents: write
 
-# 并发控制:同一时间只允许一个同步任务运行,避免重复发布冲突
 concurrency:
   group: full-sync
   cancel-in-progress: false
-
-env:
-  DOWNLOAD_JOBS: 8          # 并行下载数
-  INDEX_URL: https://ziglang.org/download/index.json
 
 jobs:
   sync_binaries:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
-      - name: 拉取仓库代码
-        uses: actions/checkout@v7
-
-      - name: 解析版本并生成下载清单
-        id: plan
-        env:
-          WANT: ${{ inputs.binvern }}
-        run: |
-          set -euo pipefail
-
-          # 1. 拉取官网全量版本清单(对象按版本号组织)
-          if ! curl -4fsSL --retry 3 --retry-delay 2 --connect-timeout 15 --max-time 180 \
-                -o "${RUNNER_TEMP}/index.json" "${INDEX_URL}"; then
-            echo "::error::获取版本清单失败: ${INDEX_URL}"
-            exit 1
-          fi
-
-          if ! jq -e 'type == "object"' "${RUNNER_TEMP}/index.json" >/dev/null 2>&1; then
-            echo "::error::获取的版本清单不是有效的JSON对象"
-            exit 1
-          fi
-
-          # 2. 定位版本:未指定取最新稳定版,指定则精确匹配
-          want="${WANT:-}"
-          if [[ -n "${want}" ]]; then
-            if ! jq -e --arg v "${want}" 'has($v)' "${RUNNER_TEMP}/index.json" >/dev/null 2>&1; then
-              echo "::error::未找到指定版本: ${want}"
-              exit 1
-            fi
-            VN="${want}"
-          else
-            VN=$(jq -r 'keys[]' "${RUNNER_TEMP}/index.json" \
-                  | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -Vr | head -n 1)
-            if [[ -z "${VN}" ]]; then
-              echo "::error::无法解析最新稳定版本"
-              exit 1
-            fi
-          fi
-
-          # 兜底跳过 dev/rc/beta/alpha 等非稳定版
-          if [[ "${VN}" =~ (-dev|rc|beta|alpha) ]]; then
-            echo "::error::解析到预发布版本 ${VN},请显式指定稳定版本号"
-            exit 1
-          fi
-
-          # 3. 生成下载清单:遍历该版本下含 tarball+shasum 的条目
-          #    "<sha256>  <文件名>",校验值直接取自官网清单,无需额外请求
-          jq -r --arg vn "${VN}" '
-            .[$vn]
-            | to_entries[]
-            | .value
-            | select(type == "object" and (.tarball != null) and (.shasum != null))
-            | "\(.shasum)  \(.tarball | sub(".*/"; ""))"
-          ' "${RUNNER_TEMP}/index.json" > "${RUNNER_TEMP}/manifest.sums"
-
-          if [[ ! -s "${RUNNER_TEMP}/manifest.sums" ]]; then
-            echo "::error::未找到任何可下载资源"
-            exit 1
-          fi
-
-          BASE_URL="https://ziglang.org/download/${VN}"
-
-          echo "version=v${VN}" >> "${GITHUB_OUTPUT}"
-          echo "zigversion=${VN}" >> "${GITHUB_OUTPUT}"
-          echo "count=$(wc -l < "${RUNNER_TEMP}/manifest.sums")" >> "${GITHUB_OUTPUT}"
-          echo "base_url=${BASE_URL}" >> "${GITHUB_OUTPUT}"
-          echo "解析到版本: ${VN} ($(wc -l < "${RUNNER_TEMP}/manifest.sums") 个资源)"
-
-      - name: 并行下载全部二进制包
-        env:
-          JOBS: ${{ env.DOWNLOAD_JOBS }}
-          BASE: ${{ steps.plan.outputs.base_url }}
-        run: |
-          set -euo pipefail
-          mkdir -p dist
-
-          download_one() {
-            local sum="$1" name="$2"
-            local url="${BASE}/${name}"
-            for i in 1 2 3; do
-              if curl -4fL --retry 3 --retry-all-errors --retry-delay 2 \
-                    --connect-timeout 15 --max-time 1800 \
-                    -o "dist/${name}" "${url}"; then
-                return 0
-              fi
-              sleep $((i * 3))
-            done
-            echo "::error::下载失败: ${url}"
-            return 1
-          }
-          export -f download_one
-
-          # 清单每行: "<sha256>  <文件名>",取两列并行下载,任一失败即整体失败
-          xargs -P "${JOBS}" -n 2 bash -c 'download_one "$@"' _ < "${RUNNER_TEMP}/manifest.sums"
-          echo "下载完成,文件数: $(find dist -type f | wc -l)"
-
-      - name: 校验 SHA256
-        run: |
-          set -euo pipefail
-          cd dist
-          sha256sum -c "${RUNNER_TEMP}/manifest.sums"
-          {
-            echo "### Zig ${{ steps.plan.outputs.zigversion }}"
-            echo ""
-            echo "共 ${{ steps.plan.outputs.count }} 个文件,SHA256 校验通过:"
-            echo ""
-            echo '```'
-            awk '{print $2}' "${RUNNER_TEMP}/manifest.sums"
-            echo '```'
-          } >> "${GITHUB_STEP_SUMMARY}"
-
-      - name: 发布到 Releases
-        if: steps.plan.outputs.count != '0'
-        uses: softprops/action-gh-release@v3
+      - name: 同步 Zig 二进制
+        uses: abldgsync/shared_actions/sync_zig.yaml@v1
         with:
-          files: dist/*
-          tag_name: "${{ steps.plan.outputs.version }}" # 用版本号作为tag(如v0.15.2)
-          name: "Zig ${{ steps.plan.outputs.version }} Binaries"
-          body: |
-            同步自 Zig 官网的二进制程序
-            - 版本: ${{ steps.plan.outputs.zigversion }}
-            - 官网下载地址: ${{ steps.plan.outputs.base_url }}
-            - 同步任务: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          overwrite_files: true
-          fail_on_unmatched_files: true
+          binvern: ${{ inputs.binvern }}
