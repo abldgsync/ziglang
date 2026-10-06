@@ -1,6 +1,6 @@
 name: Do Tools Sync For Abldg
 
-# 共享同步逻辑位于公共(Public)仓库 .sacts/sync_zig.yaml(组合 action,已钉 commit SHA)
+# 共享同步逻辑位于公共(Public)仓库 abldgsync/actions/ziglang(组合 action,见下方 uses;当前引用 @main,建议钉成具体 commit SHA 以获得可复现构建)
 on:
   # schedule:
   #   - cron: '0 2 * * *'  # 已屏蔽,不再定时执行
@@ -10,6 +10,11 @@ on:
         description: '指定 Zig 版本号(如 0.15.2,不填则使用最新稳定版)'
         required: false
         type: string
+      lastn:
+        description: '保留的最新稳定版本数量(默认 4)'
+        required: false
+        type: string
+        default: '4'
 
 permissions:
   contents: write
@@ -24,6 +29,7 @@ jobs:
     timeout-minutes: 60
     steps:
       - name: 同步 Zig 二进制
-        uses: abldgsync/.sacts/sync_zig@main
+        uses: abldgsync/actions/ziglang@main
         with:
           binvern: ${{ inputs.binvern }}
+          lastn: ${{ inputs.lastn }}
